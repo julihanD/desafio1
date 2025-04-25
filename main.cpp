@@ -171,7 +171,7 @@ int main(int argc, char *argv[])
 
 // -----------------------------------------------------------------------------
 // Función loadPixels: Carga una imagen BMP, la convierte a formato RGB888 y copia
-// sus datos en un buffer (sin incluir padding).
+// sus datos en un buffer
 unsigned char* loadPixels(QString path, int &width, int &height) {
     QImage image(path);
     if (image.isNull()) {
@@ -183,7 +183,7 @@ unsigned char* loadPixels(QString path, int &width, int &height) {
     height = image.height();
     int size = width * height * 3;
     unsigned char* buf = new unsigned char[size];
-    // Inicialización a cero usando un bucle (ya que no usamos <cstring>)
+    // Inicialización a cero usando un bucle
     for (int i = 0; i < size; ++i) {
         buf[i] = 0;
     }
