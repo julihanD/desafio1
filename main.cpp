@@ -26,271 +26,216 @@
  * - Librerías Qt para manejo de imágenes (QImage, QString).
  * - No utiliza estructuras ni STL. Solo arreglos dinámicos y memoria básica de C++.
  */
-
-
-#include <fstream>
-#include <iostream>
 #include <QCoreApplication>
 #include <QImage>
+#include <fstream>
+#include <iostream>
 
-using namespace std;
+    using namespace std;
+// Carga los píxeles de una imagen BMP
+unsigned char* loadPixels(QString path, int &width, int &height);
+// Guarda los píxeles en una imagen BMP
+bool exportImage(unsigned char* data, int width, int height, QString path);
+// Carga la semilla y datos de enmascaramiento desde un archivo de texto
+unsigned int* loadSeedMasking(const char* file, int &seed, int &n_pixels);
 
-// Prototipos de funciones ya existentes (parte del código base)
-unsigned char* loadPixels(QString input, int &width, int &height);
-bool exportImage(unsigned char* pixelData, int width, int height, QString archivoSalida);
-unsigned int* loadSeedMasking(const char* nombreArchivo, int &seed, int &n_pixels);
+// Función para revertir el enmascaramiento (lineal):
+// Se asume que "seed" es el offset en el buffer donde empieza la región afectada.
+void desenmascarar(unsigned char* img, const unsigned char* mask,
+                   const unsigned int* S, int seed, int totalBytes) {
+    if (!img || !mask || !S || totalBytes <= 0)
+        return;
+    for (int k = 0; k < totalBytes; ++k) {
+        // Se convierte el resultado (S[k] - mask[k]) a unsigned char (rango 0-255)
+        img[seed + k] = static_cast<unsigned char>((S[k] - mask[k]) & 0xFF);
+    }
+}
 
-// ====================================================================
-// Nuevas funciones de operaciones bit a bit
-// ====================================================================
-
-/*
- * Función bitwiseXOR:
- * Realiza la operación XOR entre dos bytes.
- */
-unsigned char bitwiseXOR(unsigned char a, unsigned char b) {
+// Operaciones a nivel de bits
+static inline unsigned char bxor(unsigned char a, unsigned char b) {
     return a ^ b;
 }
 
-/*
- * Función applyXOR:
- * Aplica la operación XOR a cada byte del arreglo 'data' usando la clave 'key'.
- */
-void applyXOR(unsigned char* data, int size, unsigned char key) {
-    for (int i = 0; i < size; i++) {
-        data[i] = data[i] ^ key;
-    }
+static inline unsigned char brotate_left(unsigned char v, unsigned k) {
+    k &= 7; // Asegura que k esté en el rango 0-7 (para rotar dentro de un byte)
+    return static_cast<unsigned char>(((v << k) | (v >> (8 - k))) & 0xFF);
 }
 
-/*
- * Función rotateRight:
- * Rota a la derecha los bits de un byte 'byte' en 'n' posiciones.
- */
-unsigned char rotateRight(unsigned char byte, int n) {
-    n = n % 8; // Asegurar que n esté en [0,7]
-    return (byte >> n) | (byte << (8 - n));
-}
-
-/*
- * Función rotateLeft:
- * Rota a la izquierda los bits de un byte 'byte' en 'n' posiciones.
- */
-unsigned char rotateLeft(unsigned char byte, int n) {
-    n = n % 8;
-    return (byte << n) | (byte >> (8 - n));
-}
-
-/*
- * Función shiftLeftOp:
- * Desplaza (shift left) un byte 'byte' en 'n' posiciones.
- */
-unsigned char shiftLeftOp(unsigned char byte, int n) {
-    return byte << n;
-}
-
-/*
- * Función shiftRightOp:
- * Desplaza (shift right) un byte 'byte' en 'n' posiciones.
- */
-unsigned char shiftRightOp(unsigned char byte, int n) {
-    return byte >> n;
-}
-
-// ====================================================================
-// Función main
-// ====================================================================
-int main()
+int main(int argc, char *argv[])
 {
-    // ---------------------------------------------------------------
-    // PARTE 1: Procesamiento de la imagen base (I_O.bmp)
-    // ---------------------------------------------------------------
-    // Definición de rutas de archivo de entrada (imagen original) y salida (imagen modificada)
-    QString archivoEntrada = "I_O.bmp";
-    QString archivoSalida = "I_D.bmp";
+    QCoreApplication app(argc, argv);
+    Q_UNUSED(app);
 
-    // Variables para almacenar las dimensiones de la imagen
-    int width = 0, height = 0;
+    // Cargar imagen principal (P3.bmp)
+    int w = 0, h = 0;
+    unsigned char* img = loadPixels(QString("P3.bmp"), w, h);
+    if (!img) return 1;
 
-    // Carga la imagen BMP en memoria dinámica y obtiene ancho y alto
-    unsigned char *pixelData = loadPixels(archivoEntrada, width, height);
-    if (pixelData == nullptr) {
-        cout << "Error: No se pudo cargar la imagen base. Terminando el programa." << endl;
+    // Cargar imagen de distorsión (I_M.bmp)
+    int w2 = 0, h2 = 0;
+    unsigned char* imRand = loadPixels(QString("I_M.bmp"), w2, h2);
+    if (!imRand) {
+        delete [] img;
+        return 1;
+    }
+    if (w != w2 || h != h2) {
+        cerr << "Error: Las imagenes deben tener las mismas dimensiones." << endl;
+        delete [] img;
+        delete [] imRand;
         return 1;
     }
 
-    int dataSize = width * height * 3;  // 3 canales: R, G, B
+    // Cargar imagen máscara (M.bmp)
+    int mi = 0, mj = 0;
+    unsigned char* mask = loadPixels(QString("M.bmp"), mi, mj);
+    if (!mask) {
+        delete [] img;
+        delete [] imRand;
+        return 1;
+    }
+    int totalMaskBytes = mi * mj * 3; // Total de bytes de la máscara
 
-    // Se aplican operaciones bit a bit al buffer de píxeles:
-    // 1. Aplicar XOR con una clave fija (ejemplo: 0xAA)
-    unsigned char xorKey = 0xAA;
-    applyXOR(pixelData, dataSize, xorKey);
-
-    // 2. Rotar cada byte 3 bits a la derecha
-    for (int i = 0; i < dataSize; i++) {
-        pixelData[i] = rotateRight(pixelData[i], 3);
+    // Cargar datos de enmascaramiento desde archivos de texto
+    int seed1 = 0, n1 = 0;
+    unsigned int* S1 = loadSeedMasking("M1.txt", seed1, n1);
+    if (!S1) {
+        delete [] img;
+        delete [] imRand;
+        delete [] mask;
+        return 1;
+    }
+    int seed2 = 0, n2 = 0;
+    unsigned int* S2 = loadSeedMasking("M2.txt", seed2, n2);
+    if (!S2) {
+        delete [] img;
+        delete [] imRand;
+        delete [] mask;
+        delete [] S1;
+        return 1;
     }
 
-    // 3. Rotar cada byte 3 bits a la izquierda (ejemplo para revertir)
-    for (int i = 0; i < dataSize; i++) {
-        pixelData[i] = rotateLeft(pixelData[i], 3);
-    }
+    int dataSize = w * h * 3; // Total en bytes de la imagen
 
-    // 4. Desplazar cada byte 1 bit a la izquierda (como ejemplo de operación)
-    for (int i = 0; i < dataSize; i++) {
-        pixelData[i] = shiftLeftOp(pixelData[i], 1);
-    }
+    // ========================================================
+    // Se aplican las operaciones inversas.
+    // El orden y la forma de aplicar cada paso dependerán de
+    // cómo se aplicaron originalmente las transformaciones.
+    // ========================================================
 
-    // Exporta la imagen modificada a un nuevo archivo BMP
-    bool exportI = exportImage(pixelData, width, height, archivoSalida);
-    cout << "Exportación de imagen modificada: " << exportI << endl;
-
-    // Libera la memoria usada para el buffer de píxeles
-    delete[] pixelData;
-    pixelData = nullptr;
-
-    // ---------------------------------------------------------------
-    // PARTE 2: Procesamiento de las máscaras de enmascaramiento
-    // Se leen dos archivos de máscara (M1.txt y M2.txt) y se aplican
-    // ejemplos de operaciones inversas sobre los valores RGB.
-    // ---------------------------------------------------------------
-
-    // Procesar la primera máscara (M1.txt)
-    int seed1 = 0, n_pixels1 = 0;
-    unsigned int *maskingData1 = loadSeedMasking("M1.txt", seed1, n_pixels1);
-    if (maskingData1 != nullptr) {
-        cout << "\nProcesando la primera máscara (M1.txt) con semilla: " << seed1 << endl;
-        for (int i = 0; i < n_pixels1 * 3; i += 3) {
-            // Cada píxel está representado por 3 valores (R, G, B)
-            unsigned char R = static_cast<unsigned char>(maskingData1[i]);
-            unsigned char G = static_cast<unsigned char>(maskingData1[i + 1]);
-            unsigned char B = static_cast<unsigned char>(maskingData1[i + 2]);
-
-            // Ejemplo de operaciones inversas:
-            // Se aplica XOR con la semilla para intentar revertir una transformación XOR.
-            R = bitwiseXOR(R, static_cast<unsigned char>(seed1));
-            // Se rota a la izquierda 3 bits suponiendo que originalmente se rotó a la derecha.
-            G = rotateLeft(G, 3);
-            // Se desplaza a la derecha 1 bit (inverso al desplazamiento a la izquierda).
-            B = shiftRightOp(B, 1);
-
-            cout << "Píxel M1[" << (i / 3) << "] revertido: ("
-                 << (int)R << ", " << (int)G << ", " << (int)B << ")" << endl;
+    // Paso 3 inverso: Aplicar XOR con imRand a toda la imagen
+    if (dataSize > 0 && (w2 * h2 * 3 == dataSize)) {
+        for (int i = 0; i < dataSize; ++i) {
+            img[i] = bxor(img[i], imRand[i]);
         }
-        delete[] maskingData1;
-        maskingData1 = nullptr;
+        cout << "Paso 3 inverso: XOR aplicado(con im rand)." << endl;
     }
 
-    // Procesar la segunda máscara (M2.txt)
-    int seed2 = 0, n_pixels2 = 0;
-    unsigned int *maskingData2 = loadSeedMasking("M2.txt", seed2, n_pixels2);
-    if (maskingData2 != nullptr) {
-        cout << "\nProcesando la segunda máscara (M2.txt) con semilla: " << seed2 << endl;
-        for (int i = 0; i < n_pixels2 * 3; i += 3) {
-            unsigned char R = static_cast<unsigned char>(maskingData2[i]);
-            unsigned char G = static_cast<unsigned char>(maskingData2[i + 1]);
-            unsigned char B = static_cast<unsigned char>(maskingData2[i + 2]);
-
-            // Operaciones inversas ejemplo:
-            // Se aplica XOR con la semilla.
-            R = bitwiseXOR(R, static_cast<unsigned char>(seed2));
-            // Se rota a la derecha 3 bits para revertir una rotación previa.
-            G = rotateRight(G, 3);
-            // Se desplaza a la izquierda 1 bit.
-            B = shiftLeftOp(B, 1);
-
-            cout << "Píxel M2[" << (i / 3) << "] revertido: ("
-                 << (int)R << ", " << (int)G << ", " << (int)B << ")" << endl;
+    // Paso 2 inverso: Desenmascarar usando S2 y luego rotar a la izquierda 3 bits
+    if ((n2 * 3 >= totalMaskBytes) && ((seed2 + totalMaskBytes) <= dataSize)) {
+        desenmascarar(img, mask, S2, seed2, totalMaskBytes);
+        for (int i = 0; i < dataSize; ++i) {
+            img[i] = brotate_left(img[i], 3);
         }
-        delete[] maskingData2;
-        maskingData2 = nullptr;
+        cout << "Paso 2 inverso: Desenmascarado con S2 y rotacion aplicada." << endl;
+    } else {
+        cout << "S2: La  correccion no es valida." << endl;
     }
+
+    // Paso 1 inverso: Desenmascarar usando S1 y luego aplicar XOR con imRand
+    if ((n1 * 3 >= totalMaskBytes) && ((seed1 + totalMaskBytes) <= dataSize)) {
+        desenmascarar(img, mask, S1, seed1, totalMaskBytes);
+        for (int i = 0; i < dataSize; ++i) {
+            img[i] = bxor(img[i], imRand[i]);
+        }
+        cout << "Paso 1 inverso: Desenmascarado con S1 y XOR aplicado." << endl;
+    } else {
+        cout << "S1: La region de correccion no es valida." << endl;
+    }
+
+    // Exportar la imagen resultante ("I_D.bmp")
+    if (!exportImage(img, w, h, QString("I_D.bmp"))) {
+        cerr << "Error al exportar la imagen I_D.bmp" << endl;
+    } else {
+        cout << "Imagen I_D.bmp exportada correctamente." << endl;
+    }
+
+    // Liberar memoria
+    delete [] img;
+    delete [] imRand;
+    delete [] mask;
+    delete [] S1;
+    delete [] S2;
 
     return 0;
 }
 
-// ====================================================================
-// Funciones del código base (modificadas para eliminar memcpy)
-// ====================================================================
-
-unsigned char* loadPixels(QString input, int &width, int &height) {
-    // Carga la imagen BMP usando QImage y la convierte a formato RGB888.
-    QImage imagen(input);
-    if (imagen.isNull()) {
-        cout << "Error: No se pudo cargar la imagen BMP." << endl;
+// -----------------------------------------------------------------------------
+// Función loadPixels: Carga una imagen BMP, la convierte a formato RGB888 y copia
+// sus datos en un buffer (sin incluir padding).
+unsigned char* loadPixels(QString path, int &width, int &height) {
+    QImage image(path);
+    if (image.isNull()) {
+        cerr << "Error al cargar: " << path.toStdString() << endl;
         return nullptr;
     }
-    imagen = imagen.convertToFormat(QImage::Format_RGB888);
-
-    width = imagen.width();
-    height = imagen.height();
-    int dataSize = width * height * 3;
-    unsigned char* pixelData = new unsigned char[dataSize];
-
-    // Copia los datos de la imagen línea por línea, byte a byte, sin usar memcpy.
+    image = image.convertToFormat(QImage::Format_RGB888);
+    width = image.width();
+    height = image.height();
+    int size = width * height * 3;
+    unsigned char* buf = new unsigned char[size];
+    // Inicialización a cero usando un bucle (ya que no usamos <cstring>)
+    for (int i = 0; i < size; ++i) {
+        buf[i] = 0;
+    }
     for (int y = 0; y < height; ++y) {
-        const uchar* srcLine = imagen.scanLine(y);
-        unsigned char* dstLine = pixelData + y * width * 3;
+        const uchar* line = image.scanLine(y);
+        int offset = y * width * 3;
         for (int i = 0; i < width * 3; ++i) {
-            dstLine[i] = srcLine[i];
+            buf[offset + i] = line[i];
         }
     }
-    return pixelData;
+    return buf;
 }
 
-bool exportImage(unsigned char* pixelData, int width, int height, QString archivoSalida) {
-    QImage outputImage(width, height, QImage::Format_RGB888);
-    // Copia el buffer de píxeles al objeto QImage, línea por línea, sin usar memcpy.
+// -----------------------------------------------------------------------------
+// Función exportImage: Guarda un buffer de datos RGB en un archivo BMP.
+bool exportImage(unsigned char* data, int width, int height, QString path) {
+    QImage out(width, height, QImage::Format_RGB888);
     for (int y = 0; y < height; ++y) {
-        unsigned char* srcLine = pixelData + y * width * 3;
-        uchar* dstLine = outputImage.scanLine(y);
+        uchar* line = out.scanLine(y);
+        int offset = y * width * 3;
         for (int i = 0; i < width * 3; ++i) {
-            dstLine[i] = srcLine[i];
+            line[i] = data[offset + i];
         }
     }
-    if (!outputImage.save(archivoSalida, "BMP")) {
-        cout << "Error: No se pudo guardar la imagen BMP modificada." << endl;
-        return false;
-    } else {
-        cout << "Imagen BMP modificada guardada como " << archivoSalida.toStdString() << endl;
-        return true;
-    }
+    return out.save(path, "BMP");
 }
 
-unsigned int* loadSeedMasking(const char* nombreArchivo, int &seed, int &n_pixels) {
-    ifstream archivo(nombreArchivo);
-    if (!archivo.is_open()) {
-        cout << "No se pudo abrir el archivo " << nombreArchivo << endl;
+// -----------------------------------------------------------------------------
+// Función loadSeedMasking: Lee la semilla y los tripletes RGB desde un archivo de texto.
+// La semilla se encuentra en la primera línea; luego se leen enteros para cada triplete RGB.
+unsigned int* loadSeedMasking(const char* file, int &seed, int &n_pixels) {
+    ifstream f(file);
+    if (!f) {
+        cerr << "Error al abrir " << file << endl;
         return nullptr;
     }
-
-    archivo >> seed;
-
-    int r, g, b;
-    // Contamos la cantidad de píxeles (después de la semilla, cada píxel = 3 valores)
-    while (archivo >> r >> g >> b) {
-        n_pixels++;
-    }
-    archivo.close();
-
-    // Reabrir el archivo para leer los datos
-    archivo.open(nombreArchivo);
-    if (!archivo.is_open()) {
-        cout << "Error al reabrir el archivo " << nombreArchivo << endl;
-        return nullptr;
-    }
-
-    unsigned int* RGB = new unsigned int[n_pixels * 3];
-    // Leer nuevamente la semilla (se descarta para los datos)
-    archivo >> seed;
+    f >> seed;
+    n_pixels = 0;
+    int r = 0, g = 0, b = 0;
+    while (f >> r >> g >> b)
+        ++n_pixels;
+    f.clear();
+    f.seekg(0);
+    f >> seed; // Releer la semilla para reposicionar el puntero
+    unsigned int* S = new unsigned int[n_pixels * 3];
+    // Inicializar S en 0 mediante bucle
+    for (int i = 0; i < n_pixels * 3; ++i)
+        S[i] = 0;
     for (int i = 0; i < n_pixels * 3; i += 3) {
-        archivo >> r >> g >> b;
-        RGB[i]     = r;
-        RGB[i + 1] = g;
-        RGB[i + 2] = b;
+        f >> S[i] >> S[i + 1] >> S[i + 2];
     }
-    archivo.close();
-
-    cout << "\nArchivo " << nombreArchivo << ": Semilla = " << seed
-         << ", Cantidad de píxeles leídos = " << n_pixels << endl;
-    return RGB;
+    f.close();
+    return S;
 }
+
